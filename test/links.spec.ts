@@ -235,6 +235,156 @@ describe('code collisions', () => {
 		expect(await rowCount()).toBe(1);
 		expect(await getRow('AAAAAAA')).toEqual({ code: 'AAAAAAA', url: 'https://original.example/', clicks: 3 });
 	});
+
+	it('retries when a generated code matches an existing alias in a different case', async () => {
+		await seed('aaaaaaa', 'https://alias-owner.example/', 4);
+		forceCodes(0, 1); // first attempt AAAAAAA (same as alias aaaaaaa ignoring case), second BBBBBBB
+
+		const res = await createDirect('https://newcomer.example/');
+
+		expect(createdCode(res)).toBe('BBBBBBB');
+		expect(await rowCount()).toBe(2);
+		expect(await getRow('aaaaaaa')).toEqual({ code: 'aaaaaaa', url: 'https://alias-owner.example/', clicks: 4 });
+	});
+});
+
+// Custom aliases share the code namespace; uniqueness ignores case and is enforced by D1.
+describe('custom aliases', () => {
+	function createWithAlias(url: string, alias: string) {
+		return SELF.fetch(`${BASE}/links`, { method: 'POST', body: new URLSearchParams({ url, alias }), redirect: 'manual' });
+	}
+
+	function locationCode(res: Response) {
+		return new URL(res.headers.get('Location') ?? '', BASE).searchParams.get('created');
+	}
+
+	it('stores the link under the alias as typed and redirects to it', async () => {
+		const res = await createWithAlias('https://example.com/sale', 'Summer-Sale');
+
+		expect(res.status).toBe(303);
+		expect(locationCode(res)).toBe('Summer-Sale');
+		expect(await getRow('Summer-Sale')).toEqual({ code: 'Summer-Sale', url: 'https://example.com/sale', clicks: 0 });
+
+		const hop = await visit('Summer-Sale');
+		expect(hop.status).toBe(302);
+		expect(hop.headers.get('Location')).toBe('https://example.com/sale');
+	});
+
+	it('resolves an alias typed in a different case and counts the click on the stored row', async () => {
+		await seed('Promo', 'https://example.com/promo');
+
+		const res = await visit('PROMO');
+
+		expect(res.status).toBe(302);
+		expect(res.headers.get('Location')).toBe('https://example.com/promo');
+		expect((await getRow('Promo'))?.clicks).toBe(1);
+	});
+
+	it('leaves an empty alias to the code generator', async () => {
+		const res = await createWithAlias('https://example.com/', '  ');
+
+		expect(res.status).toBe(303);
+		expect(locationCode(res)).toMatch(CODE_SHAPE);
+	});
+
+	it.each([
+		['minimum length', 'abc'],
+		['maximum length', 'a'.repeat(32)],
+		['inner hyphens', 'a-b-c'],
+		['generated-code shape', 'Abc1234'],
+	])('accepts %s', async (_name, alias) => {
+		expect((await createWithAlias('https://example.com/', alias)).status).toBe(303);
+		expect((await getRow(alias))?.code).toBe(alias);
+	});
+
+	it('rejects a taken alias with 409, keeps both inputs, and leaves the first link intact', async () => {
+		expect((await createWithAlias('https://first.example/', 'promo')).status).toBe(303);
+
+		const res = await createWithAlias('https://second.example/', 'promo');
+
+		expect(res.status).toBe(409);
+		const page = await res.text();
+		expect(page).toMatch(/role="alert"[^>]*>[^<]*already taken/);
+		expect(page).toContain('value="https://second.example/"');
+		expect(page).toContain('value="promo"');
+		expect(await rowCount()).toBe(1);
+		expect(await getRow('promo')).toEqual({ code: 'promo', url: 'https://first.example/', clicks: 0 });
+	});
+
+	it('treats an alias differing only by case as taken', async () => {
+		expect((await createWithAlias('https://first.example/', 'Promo')).status).toBe(303);
+
+		const res = await createWithAlias('https://second.example/', 'promo');
+
+		expect(res.status).toBe(409);
+		const page = await res.text();
+		expect(page).toContain('already taken');
+		expect(page).toContain('value="https://second.example/"');
+		expect(page).toContain('value="promo"');
+		expect(await rowCount()).toBe(1);
+		expect(await getRow('Promo')).toEqual({ code: 'Promo', url: 'https://first.example/', clicks: 0 });
+	});
+
+	it('lets exactly one of two concurrent creates claim an alias, with no mixed row', async () => {
+		const urls = ['https://racer-one.example/', 'https://racer-two.example/'];
+
+		const responses = await Promise.all(urls.map((url) => createWithAlias(url, 'race-alias')));
+
+		expect(responses.map((r) => r.status).sort()).toEqual([303, 409]);
+		const winner = urls[responses.findIndex((r) => r.status === 303)];
+		expect(await rowCount()).toBe(1);
+		expect(await getRow('race-alias')).toEqual({ code: 'race-alias', url: winner, clicks: 0 });
+	});
+
+	it.each([
+		['too short', 'ab'],
+		['too long', 'a'.repeat(33)],
+		['space', 'has space'],
+		['underscore', 'bad_char'],
+		['leading hyphen', '-lead'],
+		['trailing hyphen', 'trail-'],
+		['non-ASCII', 'café'],
+		['slash', 'a/b'],
+		['dot', 'a.b'],
+	])('rejects a malformed alias (%s) with 400 and saves nothing', async (_name, alias) => {
+		const res = await createWithAlias('https://example.com/kept', alias);
+
+		expect(res.status).toBe(400);
+		const page = await res.text();
+		expect(page).toMatch(/role="alert"/);
+		expect(page).toContain('value="https://example.com/kept"');
+		expect(await rowCount()).toBe(0);
+	});
+
+	it.each(['links', 'LINKS', 'Links', 'api', 'admin', 'assets', 'static', 'new', 'cdn-cgi'])(
+		'rejects the reserved word %s with 400 and saves nothing',
+		async (alias) => {
+			const res = await createWithAlias('https://example.com/', alias);
+
+			expect(res.status).toBe(400);
+			expect(await res.text()).toContain('reserved');
+			expect(await rowCount()).toBe(0);
+		},
+	);
+
+	it('rejects every fixed route of the router as an alias', async () => {
+		const { ROUTE_PATHS } = await import('../src/routes');
+		const segments = ROUTE_PATHS.map((path) => path.slice(1)).filter(Boolean);
+		expect(segments).toContain('links');
+
+		for (const alias of segments) {
+			const res = await createWithAlias('https://example.com/', alias);
+			expect(res.status, alias).toBe(400);
+		}
+		expect(await rowCount()).toBe(0);
+	});
+
+	it('echoes a rejected alias back escaped', async () => {
+		const page = await (await createWithAlias('https://example.com/', '"><script>x</script>')).text();
+
+		expect(page).not.toContain('<script>x</script>');
+		expect(page).toContain('value="&quot;&gt;&lt;script&gt;x&lt;/script&gt;"');
+	});
 });
 
 // Requirements 2 and 3: redirect and click count.
