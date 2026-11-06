@@ -1,4 +1,4 @@
-import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test';
+import { env, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 
@@ -53,11 +53,8 @@ async function fetchWithFailingDb(request: Request) {
 }
 
 /** Unit-style call into the worker, for tests that need a custom env or module-level spies. */
-async function callWorker(request: Request, workerEnv: Env = env) {
-	const ctx = createExecutionContext();
-	const res = await worker.fetch(request as Request<unknown, IncomingRequestCfProperties>, workerEnv, ctx);
-	await waitOnExecutionContext(ctx);
-	return res;
+function callWorker(request: Request, workerEnv: Env = env) {
+	return worker.fetch(request as Request<unknown, IncomingRequestCfProperties>, workerEnv);
 }
 
 beforeEach(async () => {
