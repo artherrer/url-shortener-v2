@@ -1,0 +1,1780 @@
+▗ ▗   ▖ ▖  Claude Code v2.1.319
+           Opus 5.5 · Claude Pro
+ ▘▘   ▝▝   ~/Development/url-shortener-v2
+
+
+❯ In this repo let's create an url-shortener web app. Those are the             
+  requirements:                                                                 
+  1. Create a short link. The user enters a long URL and gets back a short code 
+  (e.g.                                                                         
+     /abc123).                                                                  
+  2. Redirect. Visiting the short link redirects to the original URL.           
+  3. Click count. Each redirect increments a counter for that link.             
+  4. List links. A page shows every link with its original URL, short code, and 
+  click count.                                                                  
+  5. Persistence in a Cloudflare storage primitive (KV or D1). Data survives a  
+  restart.                                                                      
+  6. Validation on the server. Reject invalid URLs, and return a clear 404 page 
+  for                                                                           
+     unknown short codes. Show errors in the UI.                                
+  7. Runs locally with wrangler dev. A basic browser UI is enough.              
+                                                                                
+  Constraints                                                                   
+  - Infra: Cloudflare Workers or Pages, with KV or D1.                          
+                                                                                
+  Read the current scaffold first. Before writing any code, give me:            
+  - Data model and API design, with the reasoning behind each choice.           
+  - Failure modes: what happens when a D1 write fails, when two requests        
+    claim the same code at the same time, when input is malformed.              
+  - A test plan that maps each test to the requirement it proves, and how       
+    you'd show the test fails without the fix.                                  
+                                                                                
+  Constraints: D1 local only (no remote bindings), schema owned by migrations,  
+  no in-memory fallback. Wait for my approval before touching files.            
+
+⏺ I'll read the scaffold first.
+
+  Searched for 1 pattern, ran 3 shell commands (ctrl+o to expand)
+
+⏺ I've read the scaffold and haven't changed any files. Here's the design for
+  your approval.
+
+  What's in the scaffold
+
+  - Wrangler 4.148, @cloudflare/vitest-plugin 1.3.7 and Vitest 4.1. src/index.ts
+    and its test are the stock "Hello World" Worker.
+  - wrangler.jsonc already declares a D1 binding (url_shortener_db →
+    url-shortener-db). It has no database_id and no migrations_dir, and nothing
+    marks it remote, so it's local only.
+  - There is no migrations/ folder and no worker-configuration.d.ts yet, so the
+    Env type doesn't exist until wrangler types runs.
+  - The plugin includes readD1Migrations (runs in Node) and applyD1Migrations
+    (runs in the test worker). This lets the tests build their schema from the
+    same migration files as dev, with no second copy of the schema.
+
+  Data model
+
+  migrations/0001_create_links.sql, applied by wrangler d1 migrations apply 
+  --local:
+
+  CREATE TABLE links (
+    code       TEXT PRIMARY KEY,
+    url        TEXT NOT NULL,
+    clicks     INTEGER NOT NULL DEFAULT 0 CHECK (clicks >= 0),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  ) STRICT;
+
+  Choice: code is the primary key
+  Reasoning: The database itself guarantees codes are unique, which is what
+    handles two requests claiming the same code (see failure modes). It's also
+    the index the redirect lookup uses. No separate id, because nothing needs
+    one.
+  ────────────────────────────────────────
+  Choice: Click count is a column, not a table of click events
+  Reasoning: The requirement is a count. clicks = clicks + 1 in one SQL
+  statement
+    is atomic in SQLite. A click-events table would be a feature nobody asked
+    for.
+  ────────────────────────────────────────
+  Choice: No unique constraint on url
+  Reasoning: Shortening the same URL twice gives two codes, each with its own
+    count. Deduplicating would add a lookup and an unclear rule for little
+    benefit.
+  ────────────────────────────────────────
+  Choice: created_at
+  Reasoning: Sorts the list newest first.
+  ────────────────────────────────────────
+  Choice: STRICT
+  Reasoning: Rejects wrong column types at the database instead of quietly
+    converting them.
+  ────────────────────────────────────────
+  Choice: Codes are 7 base62 characters
+  Reasoning: Generated with crypto.getRandomValues and rejection sampling (bytes
+
+    ≥ 248 are thrown away, so every character is equally likely). That's 62⁷ ≈
+    3.5×10¹² possible codes, so collisions are rare but still handled. No custom
+
+    codes, since they weren't asked for.
+
+  API
+
+  The HTML is rendered on the server and uses a plain form, so it works without
+  JavaScript and errors come back in the page itself.
+
+  Route: GET /
+  Behavior: Page with the create form and a table of every link (code, short
+    link, original URL, click count), newest first
+  Requirement: 1, 4
+  ────────────────────────────────────────
+  Route: POST /links (form field url)
+  Behavior: Valid: 303 to /?created=<code>, and the page highlights the new
+  short
+    link. Invalid: 400, the page is re-rendered with the error and the input you
+
+    typed. Storage error: 500 page
+  Requirement: 1, 6
+  ────────────────────────────────────────
+  Route: GET /:code
+  Behavior: 302 to the original URL with Cache-Control: no-store, and the count
+    goes up. Unknown code: HTML 404 page
+  Requirement: 2, 3, 6
+  ────────────────────────────────────────
+  Route: Anything else
+  Behavior: A path that isn't a 7-character code gets a 404 without touching the
+
+    database. A wrong method gets 405
+  Requirement: 6
+
+  - Why 302 and not 301: browsers cache a 301, so later clicks would never reach
+    the Worker and the count would stop going up.
+  - Why 303 after creating a link: reloading the page won't submit the form
+    again.
+  - No overlap between routes and codes: a code is exactly 7 alphanumeric
+    characters, so links (5 characters) can never be mistaken for one.
+  - No JSON API: it isn't required, and the tests check the database directly
+    instead of parsing HTML. One could be added later in a few lines.
+
+  URL validation (on the server):
+  - Trim the input, then parse it with new URL().
+  - Only http: and https: are allowed. This blocks javascript: and data: links,
+    which are dangerous because the URL is both shown as a link and redirected
+    to.
+  - The URL must have a hostname and be at most 2048 characters.
+  - The stored value is the parsed href, the normalized form.
+
+  HTML escaping: every value that comes from a user (URLs, the echoed input) is
+  escaped before it goes into the page.
+
+  Files:
+  - src/index.ts: routing.
+  - src/links.ts: validation, code generation and queries.
+  - src/views.ts: HTML and escaping.
+  - migrations/0001_create_links.sql.
+  - wrangler.jsonc gets migrations_dir, still local only.
+  - The dev script applies local migrations before running wrangler dev.
+  - wrangler types generates Env.
+
+  Failure modes
+
+  Case: The insert fails (D1 throws)
+  Behavior: It's a single atomic statement, so nothing is partly saved. The
+  error
+    is logged and you get a 500 page ("Couldn't save the link, try again"). A
+    code is never shown unless its row was saved.
+  ────────────────────────────────────────
+  Case: Two requests claim the same code at once
+  Behavior: INSERT … ON CONFLICT(code) DO NOTHING RETURNING code. D1 handles
+    writes one at a time, so exactly one insert wins. The other gets no row
+  back,
+     picks a new code and retries, up to 5 attempts, then returns 500. There's
+  no
+     "check if it exists, then insert" step, which would leave a gap for a race.
+
+    INSERT OR REPLACE is ruled out because it would silently overwrite someone
+    else's link.
+  ────────────────────────────────────────
+  Case: Two redirects for the same link at once
+  Behavior: UPDATE links SET clicks = clicks + 1 WHERE code = ? RETURNING url
+    does the lookup and the increment in one round trip. The count is never read
+
+    into JavaScript and written back, so no click is lost.
+  ────────────────────────────────────────
+  Case: The redirect query fails
+  Behavior: 503 page. It doesn't guess a destination or skip counting. The count
+
+    is updated before the response is sent, not in waitUntil, so it's never lost
+
+    silently. The cost is one query's delay on each redirect.
+  ────────────────────────────────────────
+  Case: The list query fails
+  Behavior: 500 page with a message.
+  ────────────────────────────────────────
+  Case: Malformed input
+  Behavior: Wrong content type or a body that can't be parsed (formData()
+    throws), a missing or empty field, a non-http(s) scheme, no host, or a URL
+    that's too long: all give 400 with a specific message, and nothing is
+    written.
+  ────────────────────────────────────────
+  Case: Unknown or badly shaped code
+  Behavior: Wrong shape: 404 without a query. Right shape but no such row: 404.
+  ────────────────────────────────────────
+  Case: Migrations not applied
+  Behavior: Queries fail with "no such table" and you get a 500 page. The dev
+    script prevents this by applying migrations first.
+
+  Not handled: there's no login or rate limit, so anyone who can reach the app
+  can create and list links. That's fine for local use, but it matters if it's
+  ever deployed.
+
+  Test plan
+
+  The tests run in the Workers runtime with the real D1 binding. The schema
+  comes from migrations/ via readD1Migrations/applyD1Migrations, and the links
+  table is cleared before each test. I'll write the tests first and run them
+  against the scaffold to show they all fail. Then I'll implement until they
+  pass. Finally, I'll temporarily break each guard as listed below, show the
+  failing output, and undo the change.
+
+  #: 1
+  Test: Valid URL: 303, Location contains a 7-character base62 code, the row
+    exists with that url and clicks = 0
+  Requirement: 1, 5
+  How I'll show it fails without the fix: Remove the insert: no row, test fails
+  ────────────────────────────────────────
+  #: 2
+  Test: The same URL submitted twice gives two different codes
+  Requirement: 1
+  How I'll show it fails without the fix: Return a fixed code: the second insert
+
+    collides and the test fails
+  ────────────────────────────────────────
+  #: 3
+  Test: Add a row directly, then GET /code (without following the redirect):
+    exactly 302, Location is the URL
+  Requirement: 2
+  How I'll show it fails without the fix: Change it to 301: fails
+  ────────────────────────────────────────
+  #: 4
+  Test: Two visits give clicks = 2. 20 visits at the same time give clicks = 20
+  Requirement: 3
+  How I'll show it fails without the fix: Read the count in JavaScript, then
+    write it back: lost updates. I'll run this to confirm it really fails
+  locally
+  ────────────────────────────────────────
+  #: 5
+  Test: Add two rows with counts: GET / shows each code, URL and count
+  Requirement: 4
+  How I'll show it fails without the fix: Remove the table rows from the page:
+    fails
+  ────────────────────────────────────────
+  #: 6
+  Test: A stored URL containing <b> shows up escaped as &lt;b&gt;
+  Requirement: 4, 6 (safety)
+  How I'll show it fails without the fix: Remove escaping: fails
+  ────────────────────────────────────────
+  #: 7
+  Test: One test per bad input: "", spaces only, not a url, javascript:alert(1),
+
+    ftp://x, http://, 2049 characters, missing field, JSON body. Each must give
+    400, the error text in the page, and an empty table
+  Requirement: 6
+  How I'll show it fails without the fix: Remove the scheme check: javascript:
+    and ftp: fail
+  ────────────────────────────────────────
+  #: 8
+  Test: GET /zzzzzzz (unknown) and GET /a/b (wrong shape) give a 404 HTML page,
+    and other rows' counts don't change
+  Requirement: 6
+  How I'll show it fails without the fix: Return 200 or a blank page: fails
+  ────────────────────────────────────────
+  #: 9
+  Test: Collision: add a row with code AAAAAAA, force the random generator
+    (vi.spyOn(crypto, "getRandomValues")) to produce AAAAAAA and then BBBBBBB.
+    Expect BBBBBBB to be created and AAAAAAA's URL unchanged
+  Requirement: Race handling
+  How I'll show it fails without the fix: Switch to INSERT OR REPLACE: the
+    existing row is overwritten. Remove the retry: 500. Both fail
+  ────────────────────────────────────────
+  #: 10
+  Test: Always collide: after 5 attempts, a 500 page and nothing changed
+  Requirement: Race handling
+  How I'll show it fails without the fix: Retry forever: the test hangs or times
+
+    out
+  ────────────────────────────────────────
+  #: 11
+  Test: Replace D1 with a fake whose queries throw. Create gives our 500 page,
+    redirect gives our 503 page, and there's never a 303 or 302
+  Requirement: D1 write fails
+  How I'll show it fails without the fix: Remove the try/catch: the runtime's
+    generic 500 doesn't match our page, so the test fails
+  ────────────────────────────────────────
+  #: 12
+  Test: PUT / gives 405
+  Requirement: API
+  How I'll show it fails without the fix: —
+  ────────────────────────────────────────
+  #: 13
+  Test: Manual end-to-end check with the real dev server: apply migrations
+    locally, wrangler dev, create a link with curl, visit it twice, stop the
+    server, start it again. The list still shows the link with 2 clicks. I'll
+    also run wrangler d1 execute --local "SELECT * FROM links"
+  Requirement: 5, 7
+  How I'll show it fails without the fix: Restarting a process can't be done
+    inside Vitest's isolated storage, so I'll run this myself and paste the
+    output
+
+  Requirement 5 is also covered by design: there's no module-level state, so
+  data can only live in D1.
+
+  To check during implementation: whether wrangler 4.148 accepts a local-only D1
+  binding without a database_id. If it doesn't, I'll add a placeholder id. It
+  still won't be a remote binding.
+
+  Do you approve this plan? If you want changes (a JSON API, custom codes, a
+  different code length), tell me and I'll update it before writing any files.
+
+✻ Crunched for 1m 58s · done 1:08 p.m.
+
+❯ Good plan overall. Things I'm approving on purpose:                           
+  - Uniqueness enforced by the PK + ON CONFLICT DO NOTHING, no                  
+  check-then-insert.                                                            
+    My first version did exists() then INSERT and two requests could get the    
+    same alias, so this is exactly what I want.                                 
+  - clicks = clicks + 1 with RETURNING, no read/write in JS.                    
+  - No in-memory state at all. D1 is the only source of truth.                  
+  - Schema only from migrations, same files for dev and tests.                  
+                                                                                
+  Changes before you start:                                                     
+                                                                                
+  1. Test 11: removing the try/catch isn't the failure I care about. The real   
+     bug I had before was a catch that logged the error and still returned      
+     success. So the negative check should be: make the catch return the 303    
+     anyway and show the test fails.                                            
+  2. Self-referencing links. Right now I can shorten                            
+  http://localhost:8787/<code>                                                  
+     and chain redirects or build a loop, and every hop counts a click. Reject  
+     URLs whose host matches the request host and add a test for it.            
+  3. The 2048 limit should apply to the normalized href, not the raw input.     
+     new URL() can make it longer (punycode, percent-encoding). Check after     
+     parsing.                                                                   
+  4. Test 4: I'm not sure local D1 will actually interleave the read/write      
+     version, it may serialize and pass anyway. Run it against the broken       
+     version first. If you can't reproduce the lost update, tell me and don't   
+     present it as proof.                                                       
+  5. Small ones:                                                                
+     - Why 500 on create and 503 on redirect? Pick one rule and explain it.     
+     - Add rowid as tiebreaker in the ORDER BY.                                 
+     - ?created=<code> is reflected in the page: escape it and only show it if  
+       the row exists.                                                          
+     - For test 13 paste the real output (curl + d1 execute after restart),     
+       I'll put it in the README.                                               
+  6. Scope: let's build only the core first and commit it. After that,          
+     2-3 options for the extra feature with tradeoffs and I'll pick one. Don't  
+     add anything for it now.                                                   
+                                                                                
+  Update the plan with these points and wait for my OK before writing           
+
+⏺ Here's the plan with your changes. Anything not mentioned below stays as
+  approved. I still haven't written any files.
+
+  Changes
+
+  1. Test 11 now checks for a swallowed error. D1 is replaced with a fake whose
+  queries throw. On create, the test requires status 500, no Location header,
+  and our error page.
+  - How I'll show it fails: change the catch to log the error and still return
+    the 303. The test fails because it gets a 303 with a Location header. That's
+    the bug from your first version.
+  - The redirect path gets the same check. The broken version would log and
+    redirect anyway, and the test would fail on the 302.
+
+  2. Links to the app itself are rejected. After parsing, the target's host is
+  compared with the incoming request's host, and the link is rejected if they
+  match.
+  - URL already lowercases the host and drops default ports, so
+    HTTP://LOCALHOST:8787 and https://x.test:443 count as matches. I'll also
+    strip a trailing dot (localhost.), which URL doesn't do.
+  - I'm comparing host, which includes the port, as you described. So
+    http://localhost:3000/... is still allowed while you're developing locally.
+  - Not covered: aliases such as 127.0.0.1:8787 or [::1]:8787 when you're
+    browsing via localhost, and loops that go through another URL shortener.
+    Catching those would mean resolving DNS or following redirects at create
+    time, which is out of scope.
+
+  3. The 2048 limit applies after parsing. The check runs on url.href, not on
+  what you typed.
+  - New test: a path made of 700 é characters is under 2048 characters as typed
+    but over 4000 once encoded. It must get a 400 and nothing saved.
+  - How I'll show it fails: check the typed input's length instead. The test
+    then gets a 303.
+
+  4. The concurrency test is only proof if I can reproduce the bug. I'll first
+  run it against a broken version that reads the count and then writes count + 
+  1, with an await in between.
+  - If it loses updates, I'll paste that output as proof.
+  - If local D1 handles the requests one at a time and the test passes anyway,
+    I'll tell you. In that case the only guarantee is that clicks = clicks + 1
+    runs as a single atomic statement, and I won't present the test as proof.
+
+  5a. One status rule: every server-side failure we catch returns 500. That
+  covers D1 errors on create, redirect and list, and running out of collision
+  retries.
+  - The reason: a D1 exception doesn't tell us whether the problem is temporary.
+  - 503 promises "this is temporary, try again", which we can't honestly say.
+    500 is the truthful answer.
+  - Errors the client causes are 4xx: 400 for bad input, 404 for an unknown
+    code, 405 for a wrong method.
+
+  5b. The list is ordered by created_at DESC, rowid DESC. The table is STRICT
+  but still has a rowid, since it isn't WITHOUT ROWID.
+  - Test: two rows with the same created_at; the one inserted later must come
+    first.
+  - How I'll show it fails: remove rowid from the ordering. Same rule as point
+    4: if the test still passes by luck, I'll say so.
+
+  5c. Safer ?created=. The confirmation banner shows only when the value has the
+  7-character code shape and a row with that code exists. The banner shows the
+  code from the database row, escaped, never the raw parameter.
+  - Tests:
+    - ?created=<script>x</script> doesn't show up in the page.
+    - A well-formed code that doesn't exist shows no banner.
+    - An existing code shows the banner.
+  - How I'll show it fails: render the parameter directly. The first two tests
+    fail.
+
+  5d. Test 13: I'll paste the real terminal output. You'll get the curl commands
+  for create and two visits, the stop and restart of wrangler dev, then curl /
+  and wrangler d1 execute url-shortener-db --local --command "SELECT * FROM 
+  links" after the restart, all exactly as printed.
+
+  6. Scope. I'll build only the core and commit it. Since main is the default
+  branch, I'll commit on a new branch, core-shortener, unless you'd rather
+  commit to main. After that I'll give you 2–3 options for the extra feature,
+  with tradeoffs, and add nothing for it beforehand.
+
+  Updated test list
+
+  #: 1
+  Test: Valid URL: 303, 7-character code, row saved with clicks = 0
+  Requirement: 1, 5
+  How I'll show it fails without the fix: Remove the insert
+  ────────────────────────────────────────
+  #: 2
+  Test: The same URL submitted twice gives two different codes
+  Requirement: 1
+  How I'll show it fails without the fix: Return a fixed code
+  ────────────────────────────────────────
+  #: 3
+  Test: Visiting a code gives exactly 302 to the right Location
+  Requirement: 2
+  How I'll show it fails without the fix: Change it to 301
+  ────────────────────────────────────────
+  #: 4
+  Test: Two visits give a count of 2. 20 visits at the same time give 20
+    (conditional, see point 4)
+  Requirement: 3
+  How I'll show it fails without the fix: Read then write the count in
+  JavaScript
+  ────────────────────────────────────────
+  #: 5
+  Test: The list shows each code, URL and count. Ties on time are broken by
+  rowid
+  Requirement: 4
+  How I'll show it fails without the fix: Remove the table rows from the page;
+    remove rowid from the ordering
+  ────────────────────────────────────────
+  #: 6
+  Test: A stored <b> is shown escaped
+  Requirement: 4, safety
+  How I'll show it fails without the fix: Remove escaping
+  ────────────────────────────────────────
+  #: 7
+  Test: Bad inputs (empty, spaces only, not a URL, javascript:, ftp:, http://,
+    missing field, JSON body): 400, error text in the page, nothing saved
+  Requirement: 6
+  How I'll show it fails without the fix: Remove the scheme check
+  ────────────────────────────────────────
+  #: 7b
+  Test: Input that grows past 2048 characters when encoded is rejected
+  Requirement: 6
+  How I'll show it fails without the fix: Check the typed length instead
+  ────────────────────────────────────────
+  #: 7c
+  Test: Link to the app itself is rejected (same host, different case, trailing
+    dot). The same hostname with a different port is accepted
+  Requirement: 6, loops
+  How I'll show it fails without the fix: Remove the host check
+  ────────────────────────────────────────
+  #: 8
+  Test: Unknown code and wrong-shape path give a 404 page; other counts don't
+    change
+  Requirement: 6
+  How I'll show it fails without the fix: Return 200
+  ────────────────────────────────────────
+  #: 9
+  Test: A collision retries without overwriting the existing row
+  Requirement: Race handling
+  How I'll show it fails without the fix: INSERT OR REPLACE; remove the retry
+  ────────────────────────────────────────
+  #: 10
+  Test: Running out of collision retries gives 500 and changes nothing
+  Requirement: Race handling
+  How I'll show it fails without the fix: Retry forever
+  ────────────────────────────────────────
+  #: 11
+  Test: D1 throws: 500, no Location, our error page (create and redirect)
+  Requirement: Error handling
+  How I'll show it fails without the fix: The catch logs and still returns 303 /
+
+    302
+  ────────────────────────────────────────
+  #: 11b
+  Test: ?created= only shows a real code, escaped
+  Requirement: 6, safety
+  How I'll show it fails without the fix: Render the parameter directly
+  ────────────────────────────────────────
+  #: 12
+  Test: PUT / gives 405
+  Requirement: API
+  How I'll show it fails without the fix: —
+  ────────────────────────────────────────
+  #: 13
+  Test: Real dev-server run: create, visit, restart, list, d1 execute. I'll
+  paste
+    the output
+  Requirement: 5, 7
+  How I'll show it fails without the fix: —
+
+  Is this OK to start?
+
+✻ Churned for 43s · done 1:12 p.m.
+
+❯ OK, go ahead. A few things on process:                                        
+                                                                                
+  - Commit the scaffold as it is right now before touching anything, I need     
+    that first commit as my start time.                                         
+  - Commit directly to main, it's a fresh repo and I don't want a merge         
+    squashing the history.                                                      
+  - Write the tests first, run them, paste the failing output and commit        
+    them in their own commit. Then implement.                                   
+  - The temporary breaks to prove each test (301, swallowed catch, typed        
+    length, etc.) should never be committed. Just show me the diff you          
+    applied and the failing output, then revert.                                
+  - Small commits as you go, one per logical step.                              
+                                                                                
+  The two out-of-scope cases from point 2 (127.0.0.1 / [::1] aliases and        
+  loops through other shorteners) go to "Known limitations" in the README,      
+  no code for them.                                                             
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The scaffold is committed as eca09a6, so I'll start from there with the
+  migration, wrangler config, and D1 test wiring next.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ A local-only binding works without a database_id. Next: generate the types and
+  point the tests at the migration files.
+
+  Searched for 1 pattern, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Step 2: write the tests first. I'm replacing the Hello World spec with tests
+  for the agreed behavior.
+
+⏺ Write(test/links.spec.ts)
+  ⎿  Wrote 385 lines to test/links.spec.ts
+       1 import { createExecutionContext, env, SELF, waitOnExecutionConte
+         xt } from 'cloudflare:test';
+       2 import { afterEach, beforeEach, describe, expect, it, vi } from 
+         'vitest';
+       3 import worker from '../src/index';
+       4 
+       5 const BASE = 'https://short.test';
+       6 const CODE_SHAPE = /^[A-Za-z0-9]{7}$/;
+       7 const db = env.url_shortener_db;
+       8 
+     … +377 lines (ctrl+o to expand)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ All 39 failures come from assertions against the scaffold's "Hello World"
+  response, not setup errors, and the 2 passing "does not reflect" checks only
+  pass by accident. I'm running the typecheck and the test commit next.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The typecheck passes, and it's still 39 failing and 2 passing. Committing the
+  tests:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Step 3: implementation. First I'll check how new URL parses the edge cases the
+  tests rely on.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(src/links.ts)
+  ⎿  Wrote 89 lines to src/links.ts
+       1 export interface Link {
+       2   code: string;
+       3   url: string;
+       4   clicks: number;
+       5   created_at: string;
+       6 }
+       7 
+       8 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
+         uvwxyz0123456789';
+       9 const CODE_LENGTH = 7;
+     … +80 lines (ctrl+o to expand)
+
+⏺ Write(src/views.ts)
+  ⎿  Wrote 92 lines to src/views.ts
+       1 import { MAX_URL_LENGTH, type Link } from './links';
+       2 
+       3 export function escapeHtml(value: string | number): string {
+       4   return String(value)
+       5     .replace(/&/g, '&amp;')
+       6     .replace(/</g, '&lt;')
+       7     .replace(/>/g, '&gt;')
+       8     .replace(/"/g, '&quot;')
+       9     .replace(/'/g, '&#39;');
+      10 }
+     … +82 lines (ctrl+o to expand)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Write(src/index.ts)
+  ⎿  Added 94 lines, removed 13 lines
+       1 +import { CODE_PATTERN, createLink, listLinks, recordClick, vali
+         +dateUrl } from './links';                                      
+       2 +import { homePage, html, messagePage, type HomeView } from './v
+         +iews';                                                         
+       3 +                                                               
+       4  /**
+       2 - * Welcome to Cloudflare Workers! This is your first worker.   
+       3 - *                                                             
+       4 - * - Run `npm run dev` in your terminal to start a development 
+         -server                                                         
+       5 - * - Open a browser tab at http://localhost:8787/ to see your w
+         -orker in action                                                
+       6 - * - Run `npm run deploy` to publish your worker               
+       7 - *                                                             
+       8 - * Bind resources to your worker in `wrangler.jsonc`. After add
+         -ing bindings, a type definition for the                        
+       9 - * `Env` object can be regenerated with `npm run cf-typegen`.  
+      10 - *                                                             
+      11 - * Learn more at https://developers.cloudflare.com/workers/    
+       5 + * Status rule: client mistakes are 4xx (400 invalid input, 404
+         + unknown code, 405 wrong method).                              
+       6 + * Any failure on our side, including every D1 error, is 500 wi
+         +th an error page: a D1 exception                               
+       7 + * does not tell us whether retrying will help, so we do not pr
+         +omise that with 503.                                           
+       8   */
+      13 -                                                               
+       9  export default {
+      15 -  async fetch(request, env, ctx): Promise<Response> {          
+      16 -    return new Response("Hello World!");                       
+      10 +  async fetch(request, env): Promise<Response> {               
+      11 +    const url = new URL(request.url);                          
+      12 +    const db = env.url_shortener_db;                           
+      13 +                                                               
+      14 +    if (url.pathname === '/') {                                
+      15 +      if (request.method !== 'GET') return methodNotAllowed('GE
+         +T');                                                           
+      16 +      return home(db, url);                                    
+      17 +    }                                                          
+      18 +    if (url.pathname === '/links') {                           
+      19 +      if (request.method !== 'POST') return methodNotAllowed('P
+         +OST');                                                         
+      20 +      return create(request, db, url);                         
+      21 +    }                                                          
+      22 +                                                               
+      23 +    const code = url.pathname.slice(1);                        
+      24 +    if (!CODE_PATTERN.test(code)) return notFound();           
+      25 +    if (request.method !== 'GET') return methodNotAllowed('GET'
+         +);                                                             
+      26 +    return follow(db, code);                                   
+      27    },
+      28  } satisfies ExportedHandler<Env>;
+      29 +                                                               
+      30 +async function home(db: D1Database, url: URL): Promise<Response
+         +> {                                                            
+      31 +  const createdCode = url.searchParams.get('created');         
+      32 +  return renderHome(db, url, {}, 200, (links) => (createdCode ?
+         + links.find((link) => link.code === createdCode) : undefined));
+      33 +}                                                              
+      34 +                                                               
+      35 +async function create(request: Request, db: D1Database, url: UR
+         +L): Promise<Response> {                                        
+      36 +  let input: string | null;                                    
+      37 +  try {                                                        
+      38 +    const value = (await request.formData()).get('url');       
+      39 +    input = typeof value === 'string' ? value : null;          
+      40 +  } catch {                                                    
+      41 +    return renderHome(db, url, { error: 'Submit the form with a
+         + url field.' }, 400);                                          
+      42 +  }                                                            
+      43 +                                                               
+      44 +  const result = validateUrl(input, url.host);                 
+      45 +  if (!result.ok) return renderHome(db, url, { error: result.er
+         +ror, input: input ?? '' }, 400);                               
+      46 +                                                               
+      47 +  let code: string;                                            
+      48 +  try {                                                        
+      49 +    code = await createLink(db, result.url);                   
+      50 +  } catch (error) {                                            
+      51 +    console.error('Failed to create link', error);             
+      52 +    return serverError('Could not save the link. Please try aga
+         +in.');                                                         
+      53 +  }                                                            
+      54 +  // 303 so reloading the result page does not resubmit the for
+         +m.                                                             
+      55 +  return new Response(null, { status: 303, headers: { Location:
+         + `/?created=${code}` } });                                     
+      56 +}                                                              
+      57 +                                                               
+      58 +async function follow(db: D1Database, code: string): Promise<Re
+         +sponse> {                                                      
+      59 +  let target: string | null;                                   
+      60 +  try {                                                        
+      61 +    target = await recordClick(db, code);                      
+      62 +  } catch (error) {                                            
+      63 +    console.error('Failed to resolve link', code, error);      
+      64 +    return serverError('Could not load this link. Please try ag
+         +ain.');                                                        
+      65 +  }                                                            
+      66 +  if (target === null) return notFound();                      
+      67 +  // 302, not 301: a cached permanent redirect would skip the w
+         +orker and stop counting clicks.                                
+      68 +  return new Response(null, { status: 302, headers: { Location:
+         + target, 'Cache-Control': 'private, no-store' } });            
+      69 +}                                                              
+      70 +                                                               
+      71 +/** Renders the form and link list. `pickCreated` selects the b
+         +anner link from rows that actually exist. */                   
+      72 +async function renderHome(                                     
+      73 +  db: D1Database,                                              
+      74 +  url: URL,                                                    
+      75 +  view: Pick<HomeView, 'error' | 'input'>,                     
+      76 +  status: number,                                              
+      77 +  pickCreated?: (links: HomeView['links']) => HomeView['created
+         +'],                                                            
+      78 +): Promise<Response> {                                         
+      79 +  let links: HomeView['links'];                                
+      80 +  try {                                                        
+      81 +    links = await listLinks(db);                               
+      82 +  } catch (error) {                                            
+      83 +    console.error('Failed to list links', error);              
+      84 +    return serverError('Could not load links. Please try again.
+         +');                                                            
+      85 +  }                                                            
+      86 +  return html(homePage({ ...view, origin: url.origin, links, cr
+         +eated: pickCreated?.(links) }), status);                       
+      87 +}                                                              
+      88 +                                                               
+      89 +function notFound(): Response {                                
+      90 +  return html(messagePage('Link not found', 'There is no short 
+         +link with this code.'), 404);                                  
+      91 +}                                                              
+      92 +                                                               
+      93 +function methodNotAllowed(allow: string): Response {           
+      94 +  return html(messagePage('Method not allowed', `This address o
+         +nly accepts ${allow} requests.`), 405, { Allow: allow });      
+      95 +}                                                              
+      96 +                                                               
+      97 +function serverError(message: string): Response {              
+      98 +  return html(messagePage('Something went wrong', message), 500
+         +);                                                             
+      99 +}                                                              
+
+⏺ The pickCreated callback is more indirection than this needs, so I'll replace
+  it with a plain createdCode parameter.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The tests pass an unused ExecutionContext, so I'm removing it from the test
+  helper instead of adding a parameter the handler doesn't need.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All 41 tests pass and the typecheck is clean. Committing the implementation:
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Next I'm checking that the tests catch real breakage: a scratchpad script
+  temporarily breaks the code, shows the diff and failing tests, then restores
+  src/, with nothing committed.
+
+  Made 1 scratchpad edit +107 (ctrl+o to expand)
+
+⏺ I'll run the concurrency break first on its own, since you asked whether local
+  D1 actually interleaves:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I reproduced the lost update: 20 concurrent clicks were recorded as 2.
+  Checking that the result is stable over three more runs:
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ The output is buffered, so I'll check which break is currently applied:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The Vitest run is hung by the retry-forever break, so I'm stopping it and
+  restoring src/, then rerunning that break alone with a hard time limit before
+  the remaining ones.
+
+⏺ Stop Task
+  ⎿  python3 -I /private/tmp/claude-501/-Users-arturo-Development-url-short
+     ener-v2/8c5d1c7a-8f61-44a9-b377-c28f1e2ffe80/scratchpad/mutate.py
+     no-insert fixed-code 301… · stopped
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ Every break except retry-forever made the expected tests fail, with src/ clean
+  after each. Retry-forever only hung the run, so I'm making the fake random
+  generator throw after 10 calls to make that test fail on the call count.
+
+⏺ Update(test/links.spec.ts)
+  ⎿  Added 2 lines
+      198      const spy = vi.spyOn(crypto, 'getRandomValues');
+      199      let call = 0;
+      200      spy.mockImplementation(<T extends ArrayBufferView | null>(
+           array: T): T => {
+      201 +      // Bound the loop so an unbounded retry fails the call-c
+          +ount assertion instead of hanging the run.                    
+      202 +      if (call >= 10) throw new Error('getRandomValues called 
+          +more than 10 times: retry is unbounded');                     
+      203        const value = chars[Math.min(call++, chars.length - 1)];
+      204        (array as unknown as Uint8Array).fill(value);
+      205        return array;
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Retry-forever now fails cleanly ("expected 5 calls, got 11"). Committing the
+  test change:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Step 4 (test 13): a real wrangler dev run with a restart in the middle. First,
+  the local database state:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The local database is empty. Starting the first dev server:
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ Background command "Start wrangler dev (first run)" failed with exit code 1
+
+⏺ Port 8787 is already in use, and the 404 came from whatever process holds it,
+  not from this app. Checking what that process is (I won't stop it):
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Port 8787 belongs to your caveman-proxy (PID 50538, running for 9 days), so
+  I'll leave it alone and run the demo on port 8788 with npm run dev -- --port 
+  8788.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Run 1: create a link, visit it twice, and try two invalid inputs.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Run 1 behaves as expected. The trace noise comes from a grep shell function in
+  your profile; I'll paste only the commands and their real output. Now
+  stopping the server:
+
+⏺ Stop Task
+  ⎿  npm run dev -- --port 8788 >
+     /private/tmp/claude-501/-Users-arturo-Development-url-shortener-v2/8c5
+     d1c7a-8f61-44a9-b377-c28f1e2ffe80/scratchpad/dev1.log 2>&1 · stopped
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The server and its workerd processes are gone. Starting a fresh server:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ After the restart the data is still there: evf27zS with 2 clicks. One more
+  visit to confirm counting continues, then stopping the server:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Stop Task
+  ⎿  npm run dev -- --port 8788 >
+     /private/tmp/claude-501/-Users-arturo-Development-url-shortener-v2/8c5
+     d1c7a-8f61-44a9-b377-c28f1e2ffe80/scratchpad/dev2.log 2>&1 · stopped
+⏺ Last step: a README with how to run and test the app, plus the Known
+  limitations section.
+
+⏺ Write(README.md)
+  ⎿  Wrote 46 lines to README.md
+       1 # URL shortener
+       2 
+       3 A URL shortener on Cloudflare Workers with a local D1 database.
+       4 
+       5 ## Run locally
+       6 
+       7 ```sh
+       8 yarn install
+       9 npm run dev          # applies migrations to the local D1, then 
+         starts wrangler dev on :8787
+     … +37 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The core app is built, committed to main, and all 41 tests pass along with the
+  typecheck. Each break below made its test fail as planned, and the
+  concurrency bug did reproduce.
+
+  Commits on main
+
+  9376b21 Add README with run/test instructions and known limitations
+  23f5b26 Bound the collision spy so an unbounded retry fails instead of hanging
+  b0b5af6 Implement URL shortener core on D1
+  d26775f Add failing tests for the URL shortener core
+  33ad24a Add links migration and wire D1 migrations into dev and tests
+  eca09a6 first commig   ← your scaffold
+  Things that differ from what you asked:
+  - Start commit: the scaffold was already committed as eca09a6 (13:05) and
+    nothing had changed since, so there was nothing new to commit. That commit
+    is your start point. If you want a marker at the moment you said go, I can
+    add an empty commit.
+  - Tests edited after the test commit, in two places, both visible in the 
+    history:
+    - In b0b5af6, a test helper stopped passing an execution context the Worker
+      never uses. Only the types of the call changed.
+    - 23f5b26 is described under the breaks below.
+
+  Tests failing before the implementation (d26775f)
+
+  Against the Hello World scaffold, 39 tests failed and 2 passed. Every failure
+  was a real assertion error, for example expected 200 to be 303, expected 200 
+  to be 400, expected 'Hello World!' to contain …, expected [200, …] to deeply 
+  equal [302, …]. The two that passed are the "?created= is not shown back in
+  the page" checks. They only check that something is absent, so the scaffold
+  passed them by accident; the break table proves them.
+
+  Temporary breaks (never committed)
+
+  A scratchpad script applied each break, ran the full suite, then ran git 
+  checkout -- src. The working tree was clean after every one.
+
+  Break: Read the count, then write it back from JavaScript
+  Diff applied: SELECT url, clicks … then UPDATE links SET clicks = ? … with
+    row.clicks + 1
+  Test result: expected 2 to be 20: 20 concurrent clicks were recorded as 2, in
+    all 4 runs
+  ────────────────────────────────────────
+  Break: Swallowed error on create
+  Diff applied: catch → return new Response(null, { status: 303, headers: { 
+    Location: '/' } })
+  Test result: expected 303 to be 500
+  ────────────────────────────────────────
+  Break: Swallowed error on redirect
+  Diff applied: catch → 302 to /
+  Test result: expected 302 to be 500
+  ────────────────────────────────────────
+  Break: Check the typed length
+  Diff applied: url.href.length → raw.length
+  Test result: the encoded-URL test: expected 303 to be 400
+  ────────────────────────────────────────
+  Break: 301 instead of 302
+  Diff applied: status: 302 → 301
+  Test result: expected 301 to be 302
+  ────────────────────────────────────────
+  Break: No rowid tie-break
+  Diff applied: removed , rowid DESC
+  Test result: expected [1507, 1307, 1707] to deeply equal [1307, 1507, 1707]
+  ────────────────────────────────────────
+  Break: Show ?created= without checking
+  Diff applied: build the banner from the raw parameter
+  Test result: both "not shown back" tests fail
+  ────────────────────────────────────────
+  Break: No self-link check
+  Diff applied: if (false)
+  Test result: 6 self-link tests: expected 303 to be 400
+  ────────────────────────────────────────
+  Break: No scheme check
+  Diff applied: if (false)
+  Test result: javascript:, data: and ftp: tests fail
+  ────────────────────────────────────────
+  Break: No escaping
+  Diff applied: escapeHtml returns its input
+  Test result: the stored-URL and typed-input escaping tests fail
+  ────────────────────────────────────────
+  Break: INSERT OR REPLACE
+  Diff applied: replaced ON CONFLICT DO NOTHING
+  Test result: expected 'AAAAAAA' to be 'BBBBBBB': it overwrote the existing
+  link
+  ────────────────────────────────────────
+  Break: No retry
+  Diff applied: 1 attempt
+  Test result: expected "getRandomValues" to be called 5 times, but got 1
+  ────────────────────────────────────────
+  Break: Retry forever
+  Diff applied: removed the attempt limit
+  Test result: at first the whole run hung for 60s with no test result. After
+    23f5b26 (the fake generator throws after 10 calls): expected … 5  times, but
+   
+    got 11
+  ────────────────────────────────────────
+  Break: No insert / always the same code / 404 returned as 200 / no list rows
+  Diff applied: —
+  Test result: 6, 3, 3 and 3 tests fail
+
+  Test 13: real wrangler dev run, ready for the README
+
+  I used port 8788 because 8787 is held by your caveman-proxy (PID 50538). I
+  didn't stop it. The dev script applies migrations first; the log shows ✅ No 
+  migrations to apply!.
+
+  # run 1
+  $ curl -si -X POST --data-urlencode 
+  'url=https://developers.cloudflare.com/d1/' http://localhost:8788/links
+  HTTP/1.1 303 See Other
+  Location: /?created=evf27zS
+
+  $ curl -si http://localhost:8788/evf27zS
+  HTTP/1.1 302 Found
+  Location: https://developers.cloudflare.com/d1/
+  Cache-Control: private, no-store
+
+  $ curl -si http://localhost:8788/evf27zS
+  HTTP/1.1 302 Found
+  Location: https://developers.cloudflare.com/d1/
+
+  $ curl -si http://localhost:8788/zzzzzzz
+  HTTP/1.1 404 Not Found
+  <h1>Link not found</h1>
+
+  $ curl -si -X POST --data-urlencode 'url=javascript:alert(1)' 
+  http://localhost:8788/links
+  HTTP/1.1 400 Bad Request
+  <p class="error" id="url-error" role="alert">Only http:// and https:// URLs 
+  can be shortened.</p>
+
+  $ curl -si -X POST --data-urlencode 'url=http://localhost:8788/evf27zS' 
+  http://localhost:8788/links
+  HTTP/1.1 400 Bad Request
+  <p class="error" id="url-error" role="alert">Links to this shortener itself 
+  are not allowed.</p>
+
+  # server stopped (curl → exit 7, no workerd processes), then started again
+
+  $ curl -s http://localhost:8788/ | grep -A4 "<tr data-code"
+  <tr data-code="evf27zS">
+  <td><a href="/evf27zS">evf27zS</a></td>
+  <td class="url"><a href="https://developers.cloudflare.com/d1/" rel="noopener 
+  noreferrer">https://developers.cloudflare.com/d1/</a></td>
+  <td class="clicks">2</td>
+  </tr>
+
+  $ npx wrangler d1 execute url-shortener-db --local --command "SELECT code, 
+  url, clicks, created_at FROM links"
+  [
+    {
+      "results": [
+        {
+          "code": "evf27zS",
+          "url": "https://developers.cloudflare.com/d1/",
+          "clicks": 2,
+          "created_at": "2026-11-06T19:30:23.059Z"
+        }
+      ],
+      "success": true,
+      "meta": { "duration": 0 }
+    }
+  ]
+
+  $ curl -si http://localhost:8788/evf27zS
+  HTTP/1.1 302 Found
+  Location: https://developers.cloudflare.com/d1/
+  $ curl -s http://localhost:8788/ | grep 'class="clicks"'
+  <td class="clicks">3</td>
+
+  The README has a Known limitations section with the two out-of-scope cases. I
+  also added a third line there: there's no login or rate limiting, as raised in
+  the plan. Remove it if you'd rather not list it.
+
+  Options for the extra feature (not started)
+
+  1. Custom alias. You choose the code; it's stored in the same primary key and
+     inserted with ON CONFLICT DO NOTHING. A taken alias gets a 409 with a
+     message instead of a retry.
+     - Pros: it reuses the uniqueness rule you already approved, and it's the
+       race you hit before.
+     - Cost: rules for allowed characters and length (alias lengths must not
+       collide with routes like links), and the 7-character code check becomes
+       "valid code or alias".
+     - Size: small to medium.
+  2. Link expiry. A new migration adds a nullable expires_at. The redirect's
+     UPDATE … WHERE code = ? AND (expires_at IS NULL OR expires_at > now) keeps
+     the lookup and increment in one statement.
+     - Cost: telling "expired" (410) apart from "unknown" (404) needs a second
+       query, but only on that failure path. Also time-zone and input validation
+       for the date.
+     - Size: small.
+  3. Clicks per day. A daily_clicks(code, day, count) table, updated together
+     with the total in one atomic D1 batch.
+     - Pros: gives you real stats.
+     - Cost: two writes per redirect and a new stats page.
+     - Size: medium; the largest of the three.
+
+  My recommendation is 1. It's the feature people most expect from a shortener,
+  and it tests the concurrency guarantee you care about most. Which one do you
+  want?
+
+✻ Cooked for 17m 27s · done 1:31 p.m.
+
+❯ Let's go with option 1, custom alias. Reason: it's the same conflict          
+  problem as generated codes but now the user sees it, so it's a good way       
+  to prove the uniqueness handling holds up. Before coding, answer these:       
+                                                                                
+  - Case: is "Promo" the same alias as "promo"? I don't want two links that     
+    differ only by case, people will type them wrong. Tell me how you'd         
+    enforce it without a check-then-insert, and if it needs a migration.        
+  - Format: length and allowed chars, and how the route check changes.          
+    "links" and any future route must never be a valid alias.                   
+  - An alias can have the same shape as a generated code. Confirm that a        
+    generated code hitting an existing alias just retries like today.           
+  - Taken alias: 409, form re-rendered with the error and both inputs kept.     
+    No retry for aliases.                                                       
+                                                                                
+  Tests I want, same approach as before (fail first, then break the code        
+  to prove each one):                                                           
+  - Two concurrent creates with the same alias: exactly one 303 and one 409,    
+    and the row points to one of the two URLs, not a mix.                       
+  - Same alias with different case is rejected.                                 
+  - Reserved words and bad format give 400 and nothing is saved.                
+  - Break to try: exists() then INSERT. If local D1 doesn't reproduce the       
+    race, say so like you did with the clicks.                                  
+                                                                                
+  Then update the README: what I added and why, the real start time             
+  (planning started at HH:MM, before the first commit), end time, and           
+  what I'd do next. Wait for my OK on the answers before writing code.          
+
+⏺ Before answering, I'll get the real planning start time from this session's
+  transcript timestamps rather than guess it.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Before I answer, a quick check in a scratch SQLite database (not the project)
+  that the proposed index and conflict handling behave the way I'm about to
+  describe:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I checked in a scratch SQLite database (not the project), so the answers below
+  are based on real behavior:
+  - A case-insensitive unique index makes promo conflict with an existing Promo,
+    and ON CONFLICT DO NOTHING (with no column named) returns no row in that
+    case.
+  - Looking up /PROMO uses that index and finds Promo.
+  - Creating the index fails cleanly if two existing codes differ only by case.
+
+  The planning start time from this session's transcript is 13:06 (your first
+  message, at 13:06:02). The scaffold commit was 13:05:55. The core was finished
+  at about 13:33.
+
+  1. Case: Promo and promo are the same alias
+
+  Yes, it needs a migration: 0002_case_insensitive_codes.sql adds one index,
+  CREATE UNIQUE INDEX links_code_nocase ON links (code COLLATE NOCASE);.
+
+  How it's enforced with no check before the insert:
+  - The insert becomes INSERT … ON CONFLICT DO NOTHING RETURNING code, with no
+    column named after ON CONFLICT. Without a named column it covers every
+    uniqueness rule, including the new index.
+  - If no row comes back, the alias was taken, whatever the case. D1 decides
+    inside the same single statement as today.
+  - I won't keep ON CONFLICT (code). With the case-insensitive index, the
+    scratch run shows that form behaving in a way I wouldn't rely on.
+
+  Stored as typed, matched in any case:
+  - An alias is saved exactly as you typed it (Promo), and /promo, /PROMO and
+    /Promo all redirect to it.
+  - The redirect query adds COLLATE NOCASE and uses the new index (I checked the
+    query plan).
+  - Case folding only covers ASCII letters, which is fine because aliases are
+    limited to ASCII.
+
+  The same rule applies to generated codes. That's the only consistent choice:
+  otherwise a generated Promo12 and an alias promo12 could both exist.
+  - Uniqueness then drops from 62⁷ to 36⁷ ≈ 7.8×10¹⁰ possible codes, which is
+    still plenty.
+  - Existing mixed-case codes keep working and now also resolve when typed in
+    the wrong case.
+
+  Migration safety:
+  - Applying it: it only adds an index and rewrites no data. If two existing
+    codes differ only by case, creating the index fails and nothing changes. You
+    can check first with SELECT lower(code), COUNT(*) FROM links GROUP BY 1 
+    HAVING COUNT(*) > 1 (your local data is one row).
+  - Undoing it: there are no down migrations, so it would be a new migration
+    with DROP INDEX links_code_nocase plus reverting the code.
+  - Order: apply the migration before running the new code. Old code running
+    with the new index can't create a case duplicate; the worst case is a 500 on
+    a rare collision. New code without the index would miss case duplicates.
+    Locally, npm run dev and the tests apply migrations automatically.
+
+  2. Alias format and routes
+
+  - Format: 3–32 characters, letters, digits and -. It must start and end with a
+    letter or digit. Pattern: ^[A-Za-z0-9](?:[A-Za-z0-9-]{1,30})[A-Za-z0-9]$.
+  - What it excludes: no _, ., /, spaces or non-ASCII characters. So
+    favicon.ico, robots.txt and anything with a dot can never be an alias.
+  - Route check: the router matches its fixed routes (/, /links) first. After
+    that, any path segment matching the alias pattern is looked up in the
+    database; anything else is a 404 without a query. Generated codes (7
+    alphanumeric characters) are a subset of that pattern.
+
+  Reserved words:
+  - The router keeps its fixed routes in one exported list. The validator
+    rejects, regardless of case, every name in that list plus a small reserved
+    set: api, admin, assets, static, new, cdn-cgi. cdn-cgi is reserved because
+    Cloudflare uses that path.
+  - How "future routes are never valid aliases" is guaranteed: a test goes
+    through the router's route list and the reserved set and asserts that every
+    entry fails alias validation. Adding a route to the router automatically
+    makes it reserved, and the test covers it.
+  - Remaining risk: an alias created before a route of the same name is added
+    would be hidden by that route. Whoever adds the route then needs to check
+    the database for that name. I'll put this in the README rather than build
+    anything for it.
+  - Generated codes: these will also skip reserved words, so a random 7-letter
+    code can never match a fixed route.
+
+  3. A generated code that matches an existing alias
+
+  Confirmed: it retries exactly like today. The code-free ON CONFLICT DO NOTHING
+  returns no row, so a new code is generated, up to 5 attempts, then 500. This
+  includes a case-only match, for example a generated PROMO12 against an
+  existing alias promo12. There will be a test for it.
+
+  4. Taken alias
+
+  - Taken alias: 409. The form is re-rendered with "That alias is already
+    taken." and both fields keep what you typed. There's no retry.
+  - Invalid or reserved alias: 400, with both fields kept.
+  - Leaving the alias field empty gives a generated code, as today.
+  - Errors are reported one at a time: the URL is checked first, then the alias.
+
+  Tests (written first, then each proven by a break)
+
+  Test: A custom alias redirects. Visiting it in another case also redirects and
+
+    counts
+  How I'll show it fails without the fix: Remove COLLATE NOCASE from the lookup
+  ────────────────────────────────────────
+  Test: Two creates at the same time with the same alias: one 303 and one 409.
+    Exactly one row, and its URL is the one sent by the request that got the 303
+  How I'll show it fails without the fix: Check with an exists query, then do a
+    plain INSERT. If they interleave, the loser gets a 500 instead of 409. A
+    second variant uses exists check + INSERT OR REPLACE, which was your
+  original
+     bug: both get 303 and the last write wins. If local D1 runs them one after
+    the other and the test passes, I'll say so and not count it as proof
+  ────────────────────────────────────────
+  Test: Promo, then promo: 409, the first row is unchanged, and the form keeps
+    both inputs
+  How I'll show it fails without the fix: Remove the 0002 index from the test
+    migrations (a temporary break, as before)
+  ────────────────────────────────────────
+  Test: A generated code that matches an existing alias in a different case
+    retries
+  How I'll show it fails without the fix: Same: without the index, both rows get
+
+    saved
+  ────────────────────────────────────────
+  Test: Reserved words (links, LINKS, api, cdn-cgi) and bad formats (2 or 33
+    characters, a space, _, a leading or trailing -, é, a/b) give 400 and
+  nothing
+     is saved
+  How I'll show it fails without the fix: Remove the reserved check; loosen the
+    pattern
+  ────────────────────────────────────────
+  Test: Every router route and reserved word fails alias validation
+  How I'll show it fails without the fix: Add a route without reserving it
+  ────────────────────────────────────────
+  Test: A taken alias re-renders with both inputs kept
+  How I'll show it fails without the fix: Drop the alias input from the
+  re-render
+
+  README
+
+  I'll add:
+  - What I added and why.
+  - Planning start 13:06, before the first commit; the end time, taken from the
+    clock when I finish.
+  - The note about adding a route when an alias of that name already exists.
+  - What I'd do next.
+
+  Is this OK to start?
+
+✻ Churned for 1m 29s · done 1:35 p.m.
+
+❯ Approved with three changes:                                                  
+                                                                                
+  1. "ON CONFLICT (code) behaving in a way I wouldn't rely on" is too vague.    
+     Tell me exactly what you saw. My guess: a conflict on the NOCASE index     
+     isn't covered by DO NOTHING when the target is (code), so SQLite throws    
+     UNIQUE constraint failed and the user gets a 500 instead of a 409.         
+     If that's it, use it as one of the breaks for the Promo/promo test.        
+  2. Extra index vs rebuilding the table with COLLATE NOCASE on the PK: I'm     
+     OK with the index. SQLite can't change a column's collation, so the        
+     rebuild means create/copy/drop/rename, and the index is additive and       
+     fails clean. Two indexes on code is an acceptable cost. Put that           
+     reasoning in the migration comment.                                        
+  3. Skipping reserved words for generated codes: a generated code is           
+     always 7 alphanumeric chars and no reserved word has that shape, so        
+     this never runs. Drop it, unless you can show me a case where it           
+     matters.                                                                   
+                                                                                
+  For the README start time use HH:MM, planning started before this             
+  session (I reviewed my first version in a separate session). Go ahead.        
+
+⏺ First, point 1: I'll rerun what I saw on its own, plus a control case, so I
+  can tell you exactly what happened.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The command-line SQLite and D1's bundled copy both need checking: plain ON 
+  CONFLICT (code) DO NOTHING ignores the duplicate, but (code COLLATE BINARY)
+  raises the UNIQUE error that would surface as a 500. I'm running all three
+  forms against local D1 in the alias tests and keeping the plain form, with no
+  column named.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Update(test/links.spec.ts)
+  ⎿  Added 150 lines
+      235      expect(await rowCount()).toBe(1);
+      236      expect(await getRow('AAAAAAA')).toEqual({ code: 'AAAAAAA',
+            url: 'https://original.example/', clicks: 3 });
+      237    });
+      238 +                                                              
+      239 +  it('retries when a generated code matches an existing alias 
+          +in a different case', async () => {                           
+      240 +    await seed('aaaaaaa', 'https://alias-owner.example/', 4); 
+      241 +    forceCodes(0, 1); // first attempt AAAAAAA (same as alias 
+          +aaaaaaa ignoring case), second BBBBBBB                        
+      242 +                                                              
+      243 +    const res = await createDirect('https://newcomer.example/'
+          +);                                                            
+      244 +                                                              
+      245 +    expect(createdCode(res)).toBe('BBBBBBB');                 
+      246 +    expect(await rowCount()).toBe(2);                         
+      247 +    expect(await getRow('aaaaaaa')).toEqual({ code: 'aaaaaaa',
+          + url: 'https://alias-owner.example/', clicks: 4 });           
+      248 +  });                                                         
+      249  });
+      250  
+      251 +// Custom aliases share the code namespace; uniqueness ignores
+          + case and is enforced by D1.                                  
+      252 +describe('custom aliases', () => {                            
+      253 +  function createWithAlias(url: string, alias: string) {      
+      254 +    return SELF.fetch(`${BASE}/links`, { method: 'POST', body:
+          + new URLSearchParams({ url, alias }), redirect: 'manual' });  
+      255 +  }                                                           
+      256 +                                                              
+      257 +  function locationCode(res: Response) {                      
+      258 +    return new URL(res.headers.get('Location') ?? '', BASE).se
+          +archParams.get('created');                                    
+      259 +  }                                                           
+      260 +                                                              
+      261 +  it('stores the link under the alias as typed and redirects t
+          +o it', async () => {                                          
+      262 +    const res = await createWithAlias('https://example.com/sal
+          +e', 'Summer-Sale');                                           
+      263 +                                                              
+      264 +    expect(res.status).toBe(303);                             
+      265 +    expect(locationCode(res)).toBe('Summer-Sale');            
+      266 +    expect(await getRow('Summer-Sale')).toEqual({ code: 'Summe
+          +r-Sale', url: 'https://example.com/sale', clicks: 0 });       
+      267 +                                                              
+      268 +    const hop = await visit('Summer-Sale');                   
+      269 +    expect(hop.status).toBe(302);                             
+      270 +    expect(hop.headers.get('Location')).toBe('https://example.
+          +com/sale');                                                   
+      271 +  });                                                         
+      272 +                                                              
+      273 +  it('resolves an alias typed in a different case and counts t
+          +he click on the stored row', async () => {                    
+      274 +    await seed('Promo', 'https://example.com/promo');         
+      275 +                                                              
+      276 +    const res = await visit('PROMO');                         
+      277 +                                                              
+      278 +    expect(res.status).toBe(302);                             
+      279 +    expect(res.headers.get('Location')).toBe('https://example.
+          +com/promo');                                                  
+      280 +    expect((await getRow('Promo'))?.clicks).toBe(1);          
+      281 +  });                                                         
+      282 +                                                              
+      283 +  it('leaves an empty alias to the code generator', async () =
+          +> {                                                           
+      284 +    const res = await createWithAlias('https://example.com/', 
+          +'  ');                                                        
+      285 +                                                              
+      286 +    expect(res.status).toBe(303);                             
+      287 +    expect(locationCode(res)).toMatch(CODE_SHAPE);            
+      288 +  });                                                         
+      289 +                                                              
+      290 +  it.each([                                                   
+      291 +    ['minimum length', 'abc'],                                
+      292 +    ['maximum length', 'a'.repeat(32)],                       
+      293 +    ['inner hyphens', 'a-b-c'],                               
+      294 +    ['generated-code shape', 'Abc1234'],                      
+      295 +  ])('accepts %s', async (_name, alias) => {                  
+      296 +    expect((await createWithAlias('https://example.com/', alia
+          +s)).status).toBe(303);                                        
+      297 +    expect((await getRow(alias))?.code).toBe(alias);          
+      298 +  });                                                         
+      299 +                                                              
+      300 +  it('rejects a taken alias with 409, keeps both inputs, and l
+          +eaves the first link intact', async () => {                   
+      301 +    expect((await createWithAlias('https://first.example/', 'p
+          +romo')).status).toBe(303);                                    
+      302 +                                                              
+      303 +    const res = await createWithAlias('https://second.example/
+          +', 'promo');                                                  
+      304 +                                                              
+      305 +    expect(res.status).toBe(409);                             
+      306 +    const page = await res.text();                            
+      307 +    expect(page).toMatch(/role="alert"[^>]*>[^<]*already taken
+          +/);                                                           
+      308 +    expect(page).toContain('value="https://second.example/"');
+      309 +    expect(page).toContain('value="promo"');                  
+      310 +    expect(await rowCount()).toBe(1);                         
+      311 +    expect(await getRow('promo')).toEqual({ code: 'promo', url
+          +: 'https://first.example/', clicks: 0 });                     
+      312 +  });                                                         
+      313 +                                                              
+      314 +  it('treats an alias differing only by case as taken', async 
+          +() => {                                                       
+      315 +    expect((await createWithAlias('https://first.example/', 'P
+          +romo')).status).toBe(303);                                    
+      316 +                                                              
+      317 +    const res = await createWithAlias('https://second.example/
+          +', 'promo');                                                  
+      318 +                                                              
+      319 +    expect(res.status).toBe(409);                             
+      320 +    const page = await res.text();                            
+      321 +    expect(page).toContain('already taken');                  
+      322 +    expect(page).toContain('value="https://second.example/"');
+      323 +    expect(page).toContain('value="promo"');                  
+      324 +    expect(await rowCount()).toBe(1);                         
+      325 +    expect(await getRow('Promo')).toEqual({ code: 'Promo', url
+          +: 'https://first.example/', clicks: 0 });                     
+      326 +  });                                                         
+      327 +                                                              
+      328 +  it('lets exactly one of two concurrent creates claim an alia
+          +s, with no mixed row', async () => {                          
+      329 +    const urls = ['https://racer-one.example/', 'https://racer
+          +-two.example/'];                                              
+      330 +                                                              
+      331 +    const responses = await Promise.all(urls.map((url) => crea
+          +teWithAlias(url, 'race-alias')));                             
+      332 +                                                              
+      333 +    expect(responses.map((r) => r.status).sort()).toEqual([303
+          +, 409]);                                                      
+      334 +    const winner = urls[responses.findIndex((r) => r.status ==
+          += 303)];                                                      
+      335 +    expect(await rowCount()).toBe(1);                         
+      336 +    expect(await getRow('race-alias')).toEqual({ code: 'race-a
+          +lias', url: winner, clicks: 0 });                             
+      337 +  });                                                         
+      338 +                                                              
+      339 +  it.each([                                                   
+      340 +    ['too short', 'ab'],                                      
+      341 +    ['too long', 'a'.repeat(33)],                             
+      342 +    ['space', 'has space'],                                   
+      343 +    ['underscore', 'bad_char'],                               
+      344 +    ['leading hyphen', '-lead'],                              
+      345 +    ['trailing hyphen', 'trail-'],                            
+      346 +    ['non-ASCII', 'café'],                                    
+      347 +    ['slash', 'a/b'],                                         
+      348 +    ['dot', 'a.b'],                                           
+      349 +  ])('rejects a malformed alias (%s) with 400 and saves nothin
+          +g', async (_name, alias) => {                                 
+      350 +    const res = await createWithAlias('https://example.com/kep
+          +t', alias);                                                   
+      351 +                                                              
+      352 +    expect(res.status).toBe(400);                             
+      353 +    const page = await res.text();                            
+      354 +    expect(page).toMatch(/role="alert"/);                     
+      355 +    expect(page).toContain('value="https://example.com/kept"')
+          +;                                                             
+      356 +    expect(await rowCount()).toBe(0);                         
+      357 +  });                                                         
+      358 +                                                              
+      359 +  it.each(['links', 'LINKS', 'Links', 'api', 'admin', 'assets'
+          +, 'static', 'new', 'cdn-cgi'])(                               
+      360 +    'rejects the reserved word %s with 400 and saves nothing',
+      361 +    async (alias) => {                                        
+      362 +      const res = await createWithAlias('https://example.com/'
+          +, alias);                                                     
+      363 +                                                              
+      364 +      expect(res.status).toBe(400);                           
+      365 +      expect(await res.text()).toContain('reserved');         
+      366 +      expect(await rowCount()).toBe(0);                       
+      367 +    },                                                        
+      368 +  );                                                          
+      369 +                                                              
+      370 +  it('rejects every fixed route of the router as an alias', as
+          +ync () => {                                                   
+      371 +    const { ROUTE_PATHS } = await import('../src/routes');    
+      372 +    const segments = ROUTE_PATHS.map((path) => path.slice(1)).
+          +filter(Boolean);                                              
+      373 +    expect(segments).toContain('links');                      
+      374 +                                                              
+      375 +    for (const alias of segments) {                           
+      376 +      const res = await createWithAlias('https://example.com/'
+          +, alias);                                                     
+      377 +      expect(res.status, alias).toBe(400);                    
+      378 +    }                                                         
+      379 +    expect(await rowCount()).toBe(0);                         
+      380 +  });                                                         
+      381 +                                                              
+      382 +  it('echoes a rejected alias back escaped', async () => {    
+      383 +    const page = await (await createWithAlias('https://example
+          +.com/', '"><script>x</script>')).text();                      
+      384 +                                                              
+      385 +    expect(page).not.toContain('<script>x</script>');         
+      386 +    expect(page).toContain('value="&quot;&gt;&lt;script&gt;x&l
+          +t;/script&gt;"');                                             
+      387 +  });                                                         
+      388 +});                                                           
+      389 +                                                              
+      390  // Requirements 2 and 3: redirect and click count.
+      391  describe('GET /:code', () => {
+      392    it('redirects with 302 (not cacheable 301) to the original U
+           RL', async () => {
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ 30 of the 31 new tests fail for the expected reasons, and the one that passes
+  already matches the old behavior. I'm committing the tests next.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The typecheck fails only because src/routes doesn't exist yet; the
+  implementation adds it. Next, the migration in its own commit:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ With only the index added, the case-insensitive alias test passes, so D1's
+  existing ON CONFLICT (code) must match case-insensitively just like the
+  command-line SQLite. I'll confirm that with the planned breaks before
+  implementing.
+
+⏺ Write(src/routes.ts)
+  ⎿  Wrote 7 lines to src/routes.ts
+      1 /**
+      2  * Fixed routes of the app. The router's table must have exactly 
+        these keys (enforced by its type),
+      3  * and every non-root path here is reserved, so a route can never
+         be shadowed by an alias.
+      4  */
+      5 export const ROUTE_PATHS = ['/', '/links'] as const;
+      6 
+      7 export type RoutePath = (typeof ROUTE_PATHS)[number];
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ src/routes.ts is written. Next, links.ts: alias validation, one insert
+  statement shared by aliases and generated codes, and the case-insensitive
+  lookup.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now the form and the router. Here's the current view code:
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Now the router: a route table that must match ROUTE_PATHS exactly, plus the
+  alias handling in create.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ All 72 tests pass and the typecheck is clean. A quick check of the edited
+  HomeState block:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ I'm adding the breaks to the scratchpad script, so it also restores
+  migrations/ and can run the typecheck for the route-table break.
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Both check-then-insert variants still pass 72/72, so the race didn't reproduce
+  with two requests, likely because local D1 serialized them. That result
+  doesn't count as proof, so I'm temporarily raising the test to 10 racers to
+  try again.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Even with 10 concurrent requests, neither check-then-insert break reproduced
+  the race locally. I'll restore the committed test and confirm the tree is
+  clean:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I'm adding a 20 ms delay variant as labeled extra data to show the race when
+  requests overlap, though this doesn't prove local D1 overlaps them by itself.
+  Then I'll look at the remaining breaks.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Every alias break failed as expected except the two noted, and the tree is
+  clean. Next I'll run the forward migration against your local database, which
+  still has a row with evf27zS.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The migration applied, and the existing rows were kept (evf27zS and a zdZoA0Z
+  link that I didn't create, so presumably yours). Stopping the server:
+
+⏺ Stop Task
+  ⎿  npm run dev -- --port 8788 >
+     /private/tmp/claude-501/-Users-arturo-Development-url-shortener-v2/8c5
+     d1c7a-8f61-44a9-b377-c28f1e2ffe80/scratchpad/dev3.log 2>&1 · stopped
+
+⏺ Last step, the README. First, the commit times and the current time:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Custom aliases are done and committed to main. All 72 tests pass and the
+  typecheck is clean. The race you asked about did not reproduce locally, so the
+  concurrency test isn't proof for the check-then-insert break.
+
+  Commits
+
+  edc0d98 Document custom aliases, timeline, limitations and next steps
+  7061aeb Add custom aliases with case-insensitive uniqueness
+  0a165b4 Add case-insensitive unique index on link codes
+  25cf167 Add failing tests for custom aliases
+  - Failing first (25cf167): 30 of the 31 new tests failed, for example expected
+    [303, 303] to deeply equal [303, 409], expected 'CpLMGpB' to be 
+    'Summer-Sale', and Cannot find module '/src/routes'. The one that passed is
+    "empty alias falls back to a generated code", which the old code already
+    did.
+  - Typecheck gap: that commit doesn't pass the typecheck, because src/routes.ts
+    only arrives in 7061aeb.
+
+  Your point 1, checked in D1
+
+  D1 behaves the same as the command-line SQLite:
+  - ON CONFLICT (code) DO NOTHING: all 72 tests still pass. When (code) names no
+    collation it matched the case-insensitive index, so a case variant gave no
+    row, not an error. So this is not a break, and your guess was wrong for this
+    form.
+  - ON CONFLICT (code COLLATE BINARY) DO NOTHING: this is the bug you predicted:
+    expected 500 to be 409 on Promo/promo, and the generated code that matches
+    an alias in another case also gets a 500.
+
+  Breaks (none committed; the tree was clean after each)
+
+  ┌───────────────────────────┬─────────────────────────────────────────────┐
+  │           Break           │                   Result                    │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Exists check, then plain  │ Not reproduced: 72/72 pass, even with 10    │
+  │ INSERT                    │ concurrent requests. Local D1 ran them one  │
+  │                           │ after the other                             │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Exists check, then INSERT │                                             │
+  │  OR REPLACE (your         │ Not reproduced, same as above               │
+  │ original bug)             │                                             │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Same two, with a forced   │ [303, 500] and [303, 303] instead of [303,  │
+  │ 20 ms wait between check  │ 409]. This only shows the test catches the  │
+  │ and insert                │ bug once the requests overlap               │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Remove the                │ Promo/promo gives expected 303 to be 409;   │
+  │ case-insensitive index    │ the generated code that matches an alias in │
+  │ (0002)                    │  another case gives expected 'AAAAAAA' to   │
+  │                           │ be 'BBBBBBB'                                │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Remove COLLATE NOCASE     │ /PROMO: expected 404 to be 302              │
+  │ from the lookup           │                                             │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ No reserved check         │ 10 tests fail, including "every fixed       │
+  │                           │ route": links: expected 303 to be 400       │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Looser alias pattern      │ 6 bad-format tests fail                     │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Add a /stats route        │ Tests still pass; only npm run typecheck    │
+  │ without listing it in     │ catches it: TS2353: … '/stats' does not     │
+  │ ROUTE_PATHS               │ exist in type 'Record<"/" | "/links", …>'   │
+  ├───────────────────────────┼─────────────────────────────────────────────┤
+  │ Drop the alias from the   │ 3 tests fail (value="promo" missing)        │
+  │ re-rendered form          │                                             │
+  └───────────────────────────┴─────────────────────────────────────────────┘
+
+  The guarantee against the race comes from the unique index plus ON CONFLICT DO
+  NOTHING, not from the test. Both of those points are in the README.
+
+  Migration check against real local data
+
+  npm run dev applied 0002 to your existing local database, and its rows were
+  kept:
+  - evf27zS and a zdZoA0Z link that isn't from me, so I left its URL out of the
+    README.
+  - On the live server, Promo gave 303, promo gave 409 with both fields kept,
+    and links gave 400 "links" is reserved.
+  - /PROMO redirects to Promo's URL, and sqlite_master now lists
+    links_code_nocase.
+
+  README
+
+  It covers what was added and why, the Known limitations (including the race
+  result above, and that a route added after an alias with the same name hides
+  that alias), and what I'd do next. The timeline:
+  - Planning start: a literal HH:MM, for you to fill in.
+  - First commit: 13:05.
+  - Core done: 13:31.
+  - Aliases done: 13:42.
+
+✻ Cooked for 5m 52s · done 1:42 p.m.
+
+※ recap: Goal: a D1-backed URL shortener on Cloudflare Workers; the custom-alias feature is finished and committed, 72 tests pass, but local D1 never reproduced the alias race. Next: replace HH:MM in the README with your planning start time. (disable recaps in /config)
+
+❯ Last step: draft AI_NOTES.md. Keep it short, bullets, facts from this         
+  session only, I'll edit it after.                                             
+                                                                                
+  - Tools: Claude Code for planning, tests, implementation and the break        
+    checks.       
+  - What was wrong in my first version and why I redid it: swallowed D1         
+    errors returning success, in-memory fallback as a second source of          
+    truth, check-then-insert on aliases, random codes not checked for           
+    collisions, tests hitting a remote D1.                                      
+  - Most important exchange: the plan review before any code, and the           
+    test 11 change (testing the swallowed catch instead of a missing            
+    try/catch).                                                                 
+  - What the AI got wrong and how it was caught: the retry-forever test         
+    hung instead of failing; the vague "I wouldn't rely on it" about            
+    ON CONFLICT (code); the reserved-word skip for generated codes that         
+    could never run. Also include that the reviewer's guess about               
+    ON CONFLICT (code) was wrong and you checked it against D1.                 
+  - Decisions I accepted on purpose and why (PK + ON CONFLICT, atomic           
+    UPDATE ... RETURNING, extra NOCASE index vs table rebuild, 500 rule).       
+  - Risks ordered by impact: start with the race tests not reproducing          
+    locally, so the guarantee rests on the DB constraint and not on the         
+    test. Then the rest of the known limitations.                               
+                                                                                
+  Don't touch the README, I'll fill the start time myself.                      
+
+⏺ Write(AI_NOTES.md)
+  ⎿  Wrote 72 lines to AI_NOTES.md
+       1 # AI notes
+       2 
+       3 ## Tools
+       4 
+       5 - **Claude Code** for planning, tests, implementation, and the b
+         reak checks (temporary changes that
+       6   must make a test fail, shown as a diff plus failing output, th
+         en reverted and never committed).
+     … +65 lines (ctrl+o to expand)
+
+⏺ I've drafted AI_NOTES.md with the sections you listed, in that order. The
+  README is untouched, and the notes are not committed, since you'll edit them
+  first.
+
+  Things to check while editing:
+  - Your first version: the list of what was wrong with it comes from what you
+    told me. I never saw that code.
+  - The reviewer's wrong guess: I didn't see the reviewer session either. In
+    this session the guess reached me as "My guess", so the notes give it to the
+    reviewer because you said so.
+  - One item you didn't ask for: under "What the AI got wrong" I added that the
+    alias test commit (25cf167) doesn't pass the typecheck until the next
+    commit. Cut it if you don't want it.
+  - The click-count race: in the first risk, I noted that this race did
+    reproduce, so the contrast with the alias race is clear.
+
+✻ Churned for 29s · done 1:48 p.m.
+
+※ recap: You're building the URL shortener with custom aliases on D1, which is done and committed with all 72 tests passing; I've drafted AI_NOTES.md but haven't committed it. Next: edit it, then fill in the README start time. (disable recaps in /config)

@@ -9,7 +9,8 @@
 		{
 			"binding": "url_shortener_db",
 			"database_name": "url-shortener-db",
-			"migrations_dir": "migrations"
+			"migrations_dir": "migrations",
+			"database_id": "8c94a5ef-a15c-4848-9e34-3b854061a43e"
 		}
 	],
 }
