@@ -1,0 +1,13 @@
+-- Codes and custom aliases share one namespace that is unique regardless of case:
+-- "Promo" and "promo" must never both exist, because people retype links with the wrong case.
+--
+-- Why an extra index instead of COLLATE NOCASE on the primary key: SQLite cannot change a
+-- column's collation in place, so that would mean create/copy/drop/rename of the table.
+-- This index is additive, rewrites no data, and fails cleanly (nothing changes) if two
+-- existing codes already differ only by case. Check beforehand with:
+--   SELECT lower(code), COUNT(*) FROM links GROUP BY 1 HAVING COUNT(*) > 1;
+-- The cost is two indexes on `code` (the binary PK and this one), which is acceptable.
+--
+-- Rollback: a new migration with `DROP INDEX links_code_nocase;` plus reverting the code.
+-- Apply before deploying code that relies on it; older code keeps working with the index.
+CREATE UNIQUE INDEX links_code_nocase ON links (code COLLATE NOCASE);
