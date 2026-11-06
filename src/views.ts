@@ -23,7 +23,9 @@ function layout(title: string, content: string): string {
 <style>
 	body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; background: #fff; }
 	form { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
-	input[type=url] { flex: 1 1 20rem; padding: .5rem; font: inherit; }
+	form label { align-self: center; }
+	input { padding: .5rem; font: inherit; }
+	input[type=url] { flex: 1 1 20rem; }
 	button { padding: .5rem 1rem; font: inherit; }
 	.error { color: #a40000; background: #fdecec; padding: .5rem .75rem; border-radius: 4px; }
 	.created { background: #e8f5e9; padding: .5rem .75rem; border-radius: 4px; }
@@ -42,17 +44,20 @@ ${content}
 export interface HomeView {
 	origin: string;
 	links: Link[];
-	error?: string;
+	/** Which form field the error belongs to, so that input is marked invalid. */
+	error?: { field: 'url' | 'alias'; message: string };
 	input?: string;
+	aliasInput?: string;
 	created?: Link;
 }
 
-export function homePage({ origin, links, error, input, created }: HomeView): string {
+export function homePage({ origin, links, error, input, aliasInput, created }: HomeView): string {
 	const shortUrl = (code: string) => `${origin}/${code}`;
 	const banner = created
 		? `<p class="created" role="status">Short link created: <a href="/${escapeHtml(created.code)}">${escapeHtml(shortUrl(created.code))}</a></p>`
 		: '';
-	const alert = error ? `<p class="error" id="url-error" role="alert">${escapeHtml(error)}</p>` : '';
+	const alert = error ? `<p class="error" id="form-error" role="alert">${escapeHtml(error.message)}</p>` : '';
+	const invalidIf = (field: 'url' | 'alias') => (error?.field === field ? ' aria-invalid="true" aria-describedby="form-error"' : '');
 	const rows = links
 		.map(
 			(link) => `<tr data-code="${escapeHtml(link.code)}">
@@ -68,7 +73,9 @@ export function homePage({ origin, links, error, input, created }: HomeView): st
 		`<h1>URL shortener</h1>
 <form method="post" action="/links">
 	<label for="url">Long URL</label>
-	<input type="url" id="url" name="url" required placeholder="https://example.com/a/long/path" value="${escapeHtml(input ?? '')}"${error ? ' aria-invalid="true" aria-describedby="url-error"' : ''}>
+	<input type="url" id="url" name="url" required placeholder="https://example.com/a/long/path" value="${escapeHtml(input ?? '')}"${invalidIf('url')}>
+	<label for="alias">Custom alias (optional)</label>
+	<input type="text" id="alias" name="alias" placeholder="summer-sale" value="${escapeHtml(aliasInput ?? '')}"${invalidIf('alias')}>
 	<button type="submit">Shorten</button>
 </form>
 ${alert}

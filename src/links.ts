@@ -1,3 +1,5 @@
+import { ROUTE_PATHS } from './routes';
+
 export interface Link {
 	code: string;
 	url: string;
@@ -7,7 +9,14 @@ export interface Link {
 
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const CODE_LENGTH = 7;
-export const CODE_PATTERN = /^[A-Za-z0-9]{7}$/;
+/** Any path segment that can name a link: custom aliases, with generated codes as a subset. */
+export const SHORT_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{1,30}[A-Za-z0-9]$/;
+// Fixed routes plus names kept free for future routes (cdn-cgi is used by Cloudflare). Compared ignoring case.
+const RESERVED_ALIASES = new Set(
+	[...ROUTE_PATHS.map((path) => path.slice(1)).filter(Boolean), 'api', 'admin', 'assets', 'static', 'new', 'cdn-cgi'].map((word) =>
+		word.toLowerCase(),
+	),
+);
 export const MAX_URL_LENGTH = 2048;
 const MAX_CREATE_ATTEMPTS = 5;
 // Largest multiple of 62 that fits in a byte; higher bytes are discarded so every character is equally likely.
@@ -53,6 +62,21 @@ function comparableHost(host: string): string {
 	return host.toLowerCase().replace(/\.(:\d+)?$/, '$1');
 }
 
+export type AliasValidation = { ok: true; alias: string | null } | { ok: false; error: string };
+
+/** An empty alias means "generate a code". */
+export function validateAlias(input: string | null): AliasValidation {
+	const alias = (input ?? '').trim();
+	if (!alias) return { ok: true, alias: null };
+	if (!SHORT_PATH_PATTERN.test(alias)) {
+		return { ok: false, error: 'An alias is 3 to 32 letters, digits or hyphens, and cannot start or end with a hyphen.' };
+	}
+	if (RESERVED_ALIASES.has(alias.toLowerCase())) {
+		return { ok: false, error: `"${alias}" is reserved. Choose another alias.` };
+	}
+	return { ok: true, alias };
+}
+
 export function generateCode(): string {
 	let code = '';
 	while (code.length < CODE_LENGTH) {
@@ -63,24 +87,33 @@ export function generateCode(): string {
 	return code;
 }
 
+export type CreateResult = { ok: true; code: string } | { ok: false; reason: 'alias-taken' };
+
 /**
- * Inserts the link under a fresh code. Uniqueness is enforced by the primary key: a colliding
- * insert returns no row (never overwrites) and we retry with a new code.
+ * Inserts a link under `alias`, or under a fresh generated code when alias is null.
+ * Uniqueness (ignoring case) is enforced by D1's indexes, never by a lookup first. ON CONFLICT
+ * names no target so it covers every unique index: a conflicting insert returns no row and
+ * never overwrites. A taken alias is reported to the caller; a generated code is retried.
  */
-export async function createLink(db: D1Database, url: string): Promise<string> {
+export async function createLink(db: D1Database, url: string, alias: string | null): Promise<CreateResult> {
+	if (alias !== null) {
+		const code = await insertLink(db, alias, url);
+		return code ? { ok: true, code } : { ok: false, reason: 'alias-taken' };
+	}
 	for (let attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt++) {
-		const code = await db
-			.prepare('INSERT INTO links (code, url) VALUES (?, ?) ON CONFLICT (code) DO NOTHING RETURNING code')
-			.bind(generateCode(), url)
-			.first<string>('code');
-		if (code) return code;
+		const code = await insertLink(db, generateCode(), url);
+		if (code) return { ok: true, code };
 	}
 	throw new Error(`No free short code after ${MAX_CREATE_ATTEMPTS} attempts`);
 }
 
-/** Atomically counts a click and returns the target URL, or null if the code does not exist. */
+function insertLink(db: D1Database, code: string, url: string): Promise<string | null> {
+	return db.prepare('INSERT INTO links (code, url) VALUES (?, ?) ON CONFLICT DO NOTHING RETURNING code').bind(code, url).first<string>('code');
+}
+
+/** Atomically counts a click and returns the target URL, or null if no code matches (ignoring case). */
 export function recordClick(db: D1Database, code: string): Promise<string | null> {
-	return db.prepare('UPDATE links SET clicks = clicks + 1 WHERE code = ? RETURNING url').bind(code).first<string>('url');
+	return db.prepare('UPDATE links SET clicks = clicks + 1 WHERE code = ? COLLATE NOCASE RETURNING url').bind(code).first<string>('url');
 }
 
 export async function listLinks(db: D1Database): Promise<Link[]> {

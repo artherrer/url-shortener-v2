@@ -1,5 +1,14 @@
-import { CODE_PATTERN, createLink, listLinks, recordClick, validateUrl, type Link } from './links';
-import { homePage, html, messagePage } from './views';
+import { createLink, listLinks, recordClick, SHORT_PATH_PATTERN, validateAlias, validateUrl, type Link } from './links';
+import type { RoutePath } from './routes';
+import { homePage, html, messagePage, type HomeView } from './views';
+
+type Handler = (request: Request, db: D1Database, url: URL) => Promise<Response>;
+
+// Must list exactly ROUTE_PATHS (checked by `satisfies`); those paths are reserved as aliases.
+const routes = {
+	'/': { GET: (_request, db, url) => home(db, url) },
+	'/links': { POST: create },
+} satisfies Record<RoutePath, Record<string, Handler>>;
 
 /**
  * Status rule: client mistakes are 4xx (400 invalid input, 404 unknown code, 405 wrong method).
@@ -11,17 +20,14 @@ export default {
 		const url = new URL(request.url);
 		const db = env.url_shortener_db;
 
-		if (url.pathname === '/') {
-			if (request.method !== 'GET') return methodNotAllowed('GET');
-			return home(db, url);
-		}
-		if (url.pathname === '/links') {
-			if (request.method !== 'POST') return methodNotAllowed('POST');
-			return create(request, db, url);
+		if (Object.hasOwn(routes, url.pathname)) {
+			const route: Record<string, Handler> = routes[url.pathname as RoutePath];
+			const handler = Object.hasOwn(route, request.method) ? route[request.method] : undefined;
+			return handler ? handler(request, db, url) : methodNotAllowed(Object.keys(route).join(', '));
 		}
 
 		const code = url.pathname.slice(1);
-		if (!CODE_PATTERN.test(code)) return notFound();
+		if (!SHORT_PATH_PATTERN.test(code)) return notFound();
 		if (request.method !== 'GET') return methodNotAllowed('GET');
 		return follow(db, code);
 	},
@@ -33,25 +39,38 @@ function home(db: D1Database, url: URL): Promise<Response> {
 
 async function create(request: Request, db: D1Database, url: URL): Promise<Response> {
 	let input: string | null;
+	let aliasInput: string | null;
 	try {
-		const value = (await request.formData()).get('url');
-		input = typeof value === 'string' ? value : null;
+		const form = await request.formData();
+		input = formString(form, 'url');
+		aliasInput = formString(form, 'alias');
 	} catch {
-		return renderHome(db, url, { error: 'Submit the form with a url field.' }, 400);
+		return renderHome(db, url, { error: { field: 'url', message: 'Submit the form with a url field.' } }, 400);
 	}
+	const kept = { input: input ?? '', aliasInput: aliasInput ?? '' };
 
-	const result = validateUrl(input, url.host);
-	if (!result.ok) return renderHome(db, url, { error: result.error, input: input ?? '' }, 400);
+	const target = validateUrl(input, url.host);
+	if (!target.ok) return renderHome(db, url, { ...kept, error: { field: 'url', message: target.error } }, 400);
+	const alias = validateAlias(aliasInput);
+	if (!alias.ok) return renderHome(db, url, { ...kept, error: { field: 'alias', message: alias.error } }, 400);
 
-	let code: string;
+	let result: Awaited<ReturnType<typeof createLink>>;
 	try {
-		code = await createLink(db, result.url);
+		result = await createLink(db, target.url, alias.alias);
 	} catch (error) {
 		console.error('Failed to create link', error);
 		return serverError('Could not save the link. Please try again.');
 	}
+	if (!result.ok) {
+		return renderHome(db, url, { ...kept, error: { field: 'alias', message: 'That alias is already taken. Choose another one.' } }, 409);
+	}
 	// 303 so reloading the result page does not resubmit the form.
-	return new Response(null, { status: 303, headers: { Location: `/?created=${code}` } });
+	return new Response(null, { status: 303, headers: { Location: `/?created=${encodeURIComponent(result.code)}` } });
+}
+
+function formString(form: FormData, name: string): string | null {
+	const value = form.get(name);
+	return typeof value === 'string' ? value : null;
 }
 
 async function follow(db: D1Database, code: string): Promise<Response> {
@@ -67,14 +86,12 @@ async function follow(db: D1Database, code: string): Promise<Response> {
 	return new Response(null, { status: 302, headers: { Location: target, 'Cache-Control': 'private, no-store' } });
 }
 
-interface HomeState {
-	error?: string;
-	input?: string;
+interface HomeState extends Pick<HomeView, 'error' | 'input' | 'aliasInput'> {
 	/** Untrusted ?created= value; the banner only shows a link that exists in D1. */
 	createdCode?: string | null;
 }
 
-async function renderHome(db: D1Database, url: URL, { error, input, createdCode }: HomeState, status: number): Promise<Response> {
+async function renderHome(db: D1Database, url: URL, { createdCode, ...form }: HomeState, status: number): Promise<Response> {
 	let links: Link[];
 	try {
 		links = await listLinks(db);
@@ -83,7 +100,7 @@ async function renderHome(db: D1Database, url: URL, { error, input, createdCode 
 		return serverError('Could not load links. Please try again.');
 	}
 	const created = createdCode ? links.find((link) => link.code === createdCode) : undefined;
-	return html(homePage({ origin: url.origin, links, error, input, created }), status);
+	return html(homePage({ ...form, origin: url.origin, links, created }), status);
 }
 
 function notFound(): Response {
