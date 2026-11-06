@@ -1,0 +1,14 @@
+{
+	"name": "url-shortner",
+	"main": "src/index.ts",
+	"compatibility_date": "2024-10-08",
+	"observability": {
+		"enabled": true,
+	},
+	"d1_databases": [
+		{
+			"binding": "url_shortener_db",
+			"database_name": "url-shortener-db"
+		}
+	],
+}
