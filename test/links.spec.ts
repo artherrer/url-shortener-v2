@@ -198,6 +198,8 @@ describe('code collisions', () => {
 		const spy = vi.spyOn(crypto, 'getRandomValues');
 		let call = 0;
 		spy.mockImplementation(<T extends ArrayBufferView | null>(array: T): T => {
+			// Bound the loop so an unbounded retry fails the call-count assertion instead of hanging the run.
+			if (call >= 10) throw new Error('getRandomValues called more than 10 times: retry is unbounded');
 			const value = chars[Math.min(call++, chars.length - 1)];
 			(array as unknown as Uint8Array).fill(value);
 			return array;
